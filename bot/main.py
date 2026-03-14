@@ -275,6 +275,57 @@ def cmd_bet(args: argparse.Namespace) -> None:
         print(f"  Error: No token ID found for {side} side.")
         return
 
+    # --- OBI Entry Timing Analysis ---
+    from bot.signals.timing import EntryTimer
+
+    timer = EntryTimer(client)
+    try:
+        obi_signal = timer.check_entry(token_id)
+
+        vamp_str = f"{obi_signal['vamp']:.4f}" if obi_signal["vamp"] is not None else "N/A"
+        midpoint_str = f"{obi_signal['midpoint']:.4f}" if obi_signal["midpoint"] else "N/A"
+        signal_label = obi_signal["signal"].upper().replace("_", " ")
+
+        # Map signal to a short descriptor for the readout
+        if obi_signal["signal"] == "strong_buy":
+            pressure_desc = "selling pressure -- good entry"
+        elif obi_signal["signal"] == "wait":
+            pressure_desc = "buying pressure -- price rising"
+        else:
+            pressure_desc = "balanced"
+
+        print(f"\n  OBI Analysis:")
+        print(f"    OBI: {obi_signal['obi']:+.2f} ({pressure_desc})")
+        print(f"    Imbalance Ratio: {obi_signal['imbalance_ratio']:.2f}")
+        print(f"    VAMP: {vamp_str} (vs midpoint {midpoint_str})")
+        print(f"    Signal: {signal_label} -- ", end="")
+
+        if obi_signal["signal"] == "strong_buy":
+            print("placing order now")
+        elif obi_signal["signal"] == "buy_now":
+            print("placing order now")
+        elif obi_signal["signal"] == "wait":
+            print(f"consider waiting ~{obi_signal['suggested_wait_minutes']}min")
+
+        # If signal says wait and user passed --wait, actually wait
+        wait_mode = getattr(args, "wait", False)
+        if obi_signal["signal"] == "wait" and wait_mode:
+            wait_min = obi_signal["suggested_wait_minutes"] or 15
+            print(f"\n  --wait flag active. Polling order book for up to {wait_min}min...")
+            obi_signal = timer.wait_for_entry(
+                token_id, max_wait_minutes=wait_min, check_interval_seconds=60,
+            )
+            print(f"    Final signal after waiting: {obi_signal['signal'].upper().replace('_', ' ')}")
+            print(f"    Waited: {obi_signal.get('waited_seconds', 0)}s")
+            print(f"    Reason: {obi_signal['reason']}")
+        elif obi_signal["signal"] == "wait" and not wait_mode:
+            print(f"\n  Warning: OBI suggests waiting ~{obi_signal['suggested_wait_minutes']}min.")
+            print(f"    Reason: {obi_signal['reason']}")
+            print(f"    Proceeding anyway. Use --wait to actually wait.")
+    except Exception as e:
+        print(f"\n  OBI Analysis: unavailable ({e})")
+        print(f"    Proceeding without entry timing signal.")
+
     # Place order
     mode_str = "LIVE" if live_mode else "PAPER"
     print(f"\n  Placing {mode_str} order: {side} ${bet_result['size']:.2f} @ {entry_price:.4f}...")
@@ -401,6 +452,65 @@ def cmd_status(args: argparse.Namespace) -> None:
                 f"{question:<40}"
             )
         print(f"  {'-' * 85}\n")
+
+
+def cmd_soon(args: argparse.Namespace) -> None:
+    """List markets resolving soon, sorted by resolution date."""
+    client = _make_client()
+
+    max_days = args.days
+    limit = args.limit
+    min_vol = args.min_volume
+    undecided_only = args.undecided
+
+    print(f"\n  Markets resolving within {max_days} days")
+    print(f"  Filters: min_volume=${min_vol:,.0f}"
+          + (", undecided only (0.10-0.90)" if undecided_only else ""))
+
+    markets = client.get_all_active_markets(
+        min_volume=min_vol, min_liquidity=100, max_pages=5,
+    )
+
+    # Compute days to resolution and filter
+    now = datetime.now(timezone.utc)
+    candidates = []
+    for m in markets:
+        days = _days_to_resolution(m.end_date)
+        if days is None or days <= 0 or days > max_days:
+            continue
+        if undecided_only:
+            yp = m.yes_price
+            if yp is None or yp <= 0.10 or yp >= 0.90:
+                continue
+        candidates.append((days, m))
+
+    candidates.sort(key=lambda x: x[0])
+    candidates = candidates[:limit]
+
+    if not candidates:
+        print("  No markets found matching filters.\n")
+        return
+
+    print(f"  Found {len(candidates)} markets:\n")
+    print(f"  {'#':<4} {'Resolves':<10} {'YES':>6} {'NO':>6} {'Volume':>12} {'Question'}")
+    print(f"  {'-' * 95}")
+
+    for i, (days, m) in enumerate(candidates, 1):
+        if days < 1:
+            time_str = f"{days * 24:.1f}h"
+        else:
+            time_str = f"{days:.1f}d"
+
+        yes = f"{m.yes_price:.2f}" if m.yes_price is not None else "  -- "
+        no = f"{m.no_price:.2f}" if m.no_price is not None else "  -- "
+        vol = f"${m.volume:,.0f}"
+        q = _truncate(m.question, 50)
+
+        print(f"  {i:<4} {time_str:<10} {yes:>6} {no:>6} {vol:>12} {q}")
+
+    print(f"  {'-' * 95}")
+    print(f"\n  Tip: Use 'python -m bot bet <condition_id> <your_probability>' to bet on a market.")
+    print(f"  Copy the condition_id from Polymarket's URL or API.\n")
 
 
 def cmd_paper_scan(args: argparse.Namespace) -> None:
@@ -567,6 +677,146 @@ def cmd_paper_scan(args: argparse.Namespace) -> None:
         print("  Use 'python -m bot resolve' to check for resolutions.\n")
 
 
+def cmd_arb(args: argparse.Namespace) -> None:
+    """Scan for multi-outcome arb opportunities and optimize allocations."""
+    from bot.arb.detector import ArbDetector, print_opportunities
+
+    budget: float = args.budget
+    min_gap: float = args.min_gap
+    no_books: bool = args.no_books
+
+    client = _make_client()
+    detector = ArbDetector(client, budget=budget)
+
+    print(f"\n  Scanning for multi-outcome arbitrage opportunities...")
+    print(f"  Budget: ${budget:.2f}")
+    print(f"  Min gap: {min_gap:.2%}")
+    print(f"  Order books: {'disabled' if no_books else 'enabled'}")
+    print()
+
+    opportunities = detector.scan_and_optimize(
+        min_gap=min_gap,
+        fetch_order_books=not no_books,
+    )
+
+    print_opportunities(opportunities)
+
+    if opportunities:
+        # Print detailed allocation report for the best opportunity
+        best = opportunities[0]
+        print("  Detailed allocation for best opportunity:")
+        best.allocation.print_report()
+
+
+def cmd_montecarlo(args: argparse.Namespace) -> None:
+    """Run Monte Carlo stress test on a strategy."""
+    from bot.backtester.data import fetch_resolved_markets
+    from bot.backtester.strategies import get_strategy
+    from bot.backtester.monte_carlo import MonteCarloSimulator
+
+    strategy_name: str = args.strategy
+    n_sims: int = args.sims
+    limit: int = args.limit
+    min_volume: float = args.min_volume
+    bankroll: float = args.bankroll
+    kelly_mult: float = args.kelly_mult
+    noise: float = args.noise
+    dropout: float = args.dropout
+    ruin_threshold: float = args.ruin_threshold
+
+    # Look up strategy
+    try:
+        strategy_fn = get_strategy(strategy_name)
+    except KeyError as e:
+        print(f"\n  Error: {e}")
+        return
+
+    print(f"\n  Monte Carlo Configuration:")
+    print(f"    Strategy:          {strategy_name}")
+    print(f"    Simulations:       {n_sims}")
+    print(f"    Market limit:      {limit}")
+    print(f"    Min volume:        ${min_volume:,.0f}")
+    print(f"    Starting bankroll: ${bankroll:.2f}")
+    print(f"    Kelly multiplier:  {kelly_mult}")
+    print(f"    Estimation noise:  {noise:.2%} std dev")
+    print(f"    Dropout rate:      {dropout:.0%}")
+    print(f"    Ruin threshold:    ${ruin_threshold:.2f}")
+
+    # Fetch resolved markets
+    print(f"\n  Fetching resolved markets from Polymarket...")
+    markets = fetch_resolved_markets(min_volume=min_volume, limit=limit)
+    print(f"  Fetched {len(markets)} resolved markets.")
+
+    if not markets:
+        print("  No resolved markets found. Try lowering --min-volume.")
+        return
+
+    # Run Monte Carlo
+    simulator = MonteCarloSimulator(
+        strategy=strategy_fn,
+        markets=markets,
+        n_simulations=n_sims,
+        bankroll=bankroll,
+        kelly_multiplier=kelly_mult,
+        estimation_noise=noise,
+        dropout_rate=dropout,
+        ruin_threshold=ruin_threshold,
+    )
+    result = simulator.run()
+
+    # Print report
+    result.print_report()
+
+
+def cmd_backtest(args: argparse.Namespace) -> None:
+    """Run a backtesting strategy against historically resolved markets."""
+    from bot.backtester.data import fetch_resolved_markets
+    from bot.backtester.engine import BacktestEngine
+    from bot.backtester.strategies import get_strategy
+
+    strategy_name: str = args.strategy
+    min_volume: float = args.min_volume
+    limit: int = args.limit
+    bankroll: float = args.bankroll
+    kelly_mult: float = args.kelly_mult
+
+    # Look up strategy
+    try:
+        strategy_fn = get_strategy(strategy_name)
+    except KeyError as e:
+        print(f"\n  Error: {e}")
+        return
+
+    print(f"\n  Backtest Configuration:")
+    print(f"    Strategy:          {strategy_name}")
+    print(f"    Min volume:        ${min_volume:,.0f}")
+    print(f"    Market limit:      {limit}")
+    print(f"    Starting bankroll: ${bankroll:.2f}")
+    print(f"    Kelly multiplier:  {kelly_mult}")
+    print(f"    Market price proxy: 0.50 (Option A — coin-flip assumption)")
+
+    # Fetch resolved markets
+    print(f"\n  Fetching resolved markets from Polymarket...")
+    markets = fetch_resolved_markets(min_volume=min_volume, limit=limit)
+    print(f"  Fetched {len(markets)} resolved markets.")
+
+    if not markets:
+        print("  No resolved markets found. Try lowering --min-volume.")
+        return
+
+    # Run backtest
+    print(f"  Running backtest with '{strategy_name}' strategy...")
+    engine = BacktestEngine(
+        strategy=strategy_fn,
+        bankroll=bankroll,
+        kelly_multiplier=kelly_mult,
+    )
+    result = engine.run(markets)
+
+    # Print report
+    result.print_report()
+
+
 def _estimate_p_true_from_scan(result, p_market: float) -> float | None:
     """Derive a p_true estimate from scanner results.
 
@@ -684,6 +934,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--live", action="store_true",
         help="Place a real order (default is paper mode).",
     )
+    bet_parser.add_argument(
+        "--wait", action="store_true",
+        help="If OBI says wait, actually wait for a better entry (polls order book).",
+    )
 
     # --- resolve ---
     subparsers.add_parser(
@@ -693,6 +947,27 @@ def build_parser() -> argparse.ArgumentParser:
     # --- status ---
     subparsers.add_parser(
         "status", help="Print portfolio status and P&L summary."
+    )
+
+    # --- soon ---
+    soon_parser = subparsers.add_parser(
+        "soon", help="List markets resolving soon, sorted by date."
+    )
+    soon_parser.add_argument(
+        "--days", type=float, default=3.0,
+        help="Show markets resolving within this many days (default: 3).",
+    )
+    soon_parser.add_argument(
+        "--limit", type=int, default=30,
+        help="Max markets to display (default: 30).",
+    )
+    soon_parser.add_argument(
+        "--min-volume", type=float, default=5000,
+        help="Min total volume in USD (default: 5000).",
+    )
+    soon_parser.add_argument(
+        "--undecided", action="store_true",
+        help="Only show markets where YES price is between 0.10 and 0.90 (not settled).",
     )
 
     # --- paper-scan ---
@@ -706,6 +981,91 @@ def build_parser() -> argparse.ArgumentParser:
     paper_parser.add_argument(
         "--max-bets", type=int, default=5,
         help="Max paper bets to place per run (default: 5).",
+    )
+
+    # --- arb ---
+    arb_parser = subparsers.add_parser(
+        "arb", help="Scan for multi-outcome arb and optimize allocations."
+    )
+    arb_parser.add_argument(
+        "--budget", type=float, default=10.0,
+        help="Budget in USD for the arb (default: 10.0).",
+    )
+    arb_parser.add_argument(
+        "--min-gap", type=float, default=0.02,
+        help="Minimum price gap to consider (default: 0.02 = 2%%).",
+    )
+    arb_parser.add_argument(
+        "--no-books", action="store_true",
+        help="Skip fetching order books (use price-only model).",
+    )
+
+    # --- montecarlo ---
+    mc_parser = subparsers.add_parser(
+        "montecarlo", help="Monte Carlo stress test a strategy."
+    )
+    mc_parser.add_argument(
+        "--strategy", type=str, default="always_fifty",
+        choices=["always_fifty", "always_yes_60", "keyword"],
+        help="Strategy to stress test (default: always_fifty).",
+    )
+    mc_parser.add_argument(
+        "--sims", type=int, default=1000,
+        help="Number of simulations to run (default: 1000).",
+    )
+    mc_parser.add_argument(
+        "--limit", type=int, default=200,
+        help="Max resolved markets to fetch (default: 200).",
+    )
+    mc_parser.add_argument(
+        "--min-volume", type=float, default=10000,
+        help="Min volume in USD for resolved markets (default: 10000).",
+    )
+    mc_parser.add_argument(
+        "--bankroll", type=float, default=10.0,
+        help="Starting bankroll in USD (default: 10.0).",
+    )
+    mc_parser.add_argument(
+        "--kelly-mult", type=float, default=0.25,
+        help="Kelly fraction multiplier (default: 0.25 = quarter Kelly).",
+    )
+    mc_parser.add_argument(
+        "--noise", type=float, default=0.05,
+        help="Estimation noise std dev (default: 0.05).",
+    )
+    mc_parser.add_argument(
+        "--dropout", type=float, default=0.1,
+        help="Market dropout rate, fraction of markets randomly skipped (default: 0.1).",
+    )
+    mc_parser.add_argument(
+        "--ruin-threshold", type=float, default=1.0,
+        help="Bankroll below which counts as ruin (default: 1.0).",
+    )
+
+    # --- backtest ---
+    bt_parser = subparsers.add_parser(
+        "backtest", help="Run a strategy against resolved markets."
+    )
+    bt_parser.add_argument(
+        "--strategy", type=str, default="always_fifty",
+        choices=["always_fifty", "always_yes_60", "keyword"],
+        help="Strategy to backtest (default: always_fifty).",
+    )
+    bt_parser.add_argument(
+        "--min-volume", type=float, default=10000,
+        help="Min volume in USD for resolved markets (default: 10000).",
+    )
+    bt_parser.add_argument(
+        "--limit", type=int, default=200,
+        help="Max resolved markets to fetch (default: 200).",
+    )
+    bt_parser.add_argument(
+        "--bankroll", type=float, default=10.0,
+        help="Starting bankroll in USD (default: 10.0).",
+    )
+    bt_parser.add_argument(
+        "--kelly-mult", type=float, default=0.25,
+        help="Kelly fraction multiplier (default: 0.25 = quarter Kelly).",
     )
 
     return parser
@@ -727,7 +1087,11 @@ def main(argv: list[str] | None = None) -> None:
         "bet": cmd_bet,
         "resolve": cmd_resolve,
         "status": cmd_status,
+        "soon": cmd_soon,
         "paper-scan": cmd_paper_scan,
+        "arb": cmd_arb,
+        "backtest": cmd_backtest,
+        "montecarlo": cmd_montecarlo,
     }
 
     handler = commands.get(args.command)
